@@ -8,6 +8,7 @@ from collections.abc import Callable
 from functools import wraps
 from typing import ParamSpec, TypeVar
 
+import httpx
 from py_clob_client.client import ClobClient as BaseClobClient
 from py_clob_client.clob_types import BookParams
 
@@ -155,6 +156,11 @@ class ClobClient:
         self._host = host
         self._max_retries = max_retries
         self._rate_limiter = RateLimiter(requests_per_second)
+        self._http_client = httpx.Client(http2=True)
+        # POLY_API_KEY header grants relayer rate limits; omit if no key configured
+        self._auth_headers: dict[str, str] = (
+            {"POLY_API_KEY": self._api_key} if self._api_key else {}
+        )
 
         # Initialize the underlying client (read-only, no auth needed for queries)
         self._client = BaseClobClient(host)
@@ -188,13 +194,15 @@ class ClobClient:
         self._rate_limiter.acquire_sync()
 
         all_markets: list[Market] = []
-        cursor: str | None = None
+        cursor: str = "MA=="
 
         while True:
-            if cursor:
-                response = self._client.get_simplified_markets(cursor)
-            else:
-                response = self._client.get_simplified_markets()
+            url = f"{self._host}/simplified-markets?next_cursor={cursor}"
+            resp = self._http_client.get(url)
+            if resp.status_code != 200:
+                from py_clob_client.exceptions import PolyApiException
+                raise PolyApiException(resp)
+            response = resp.json()
 
             data = response.get("data", [])
             for market_data in data:
