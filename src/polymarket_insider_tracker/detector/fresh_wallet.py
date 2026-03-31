@@ -15,7 +15,7 @@ from polymarket_insider_tracker.profiler.models import WalletProfile
 logger = logging.getLogger(__name__)
 
 # Default configuration
-DEFAULT_MIN_TRADE_SIZE = Decimal("1000")  # $1,000 minimum trade size
+DEFAULT_MIN_TRADE_SIZE = Decimal("50")  # $50 minimum trade size
 DEFAULT_MAX_NONCE = 5  # Max nonce to be considered fresh
 DEFAULT_MAX_AGE_HOURS = 48.0  # Max age in hours to be considered fresh
 

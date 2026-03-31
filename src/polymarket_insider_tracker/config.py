@@ -18,7 +18,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class DatabaseSettings(BaseSettings):
     """Database connection settings."""
 
-    model_config = SettingsConfigDict(env_prefix="")
+    model_config = SettingsConfigDict(env_prefix="", env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     url: str = Field(
         alias="DATABASE_URL",
@@ -37,7 +37,7 @@ class DatabaseSettings(BaseSettings):
 class RedisSettings(BaseSettings):
     """Redis connection settings."""
 
-    model_config = SettingsConfigDict(env_prefix="")
+    model_config = SettingsConfigDict(env_prefix="", env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     url: str = Field(
         default="redis://localhost:6379",
@@ -57,7 +57,7 @@ class RedisSettings(BaseSettings):
 class PolygonSettings(BaseSettings):
     """Polygon blockchain RPC settings."""
 
-    model_config = SettingsConfigDict(env_prefix="POLYGON_")
+    model_config = SettingsConfigDict(env_prefix="POLYGON_", env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     rpc_url: str = Field(
         default="https://polygon-rpc.com",
@@ -84,7 +84,7 @@ class PolygonSettings(BaseSettings):
 class PolymarketSettings(BaseSettings):
     """Polymarket API settings."""
 
-    model_config = SettingsConfigDict(env_prefix="POLYMARKET_")
+    model_config = SettingsConfigDict(env_prefix="POLYMARKET_", env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     ws_url: str = Field(
         default="wss://ws-subscriptions-clob.polymarket.com/ws/market",
@@ -106,10 +106,42 @@ class PolymarketSettings(BaseSettings):
         return v
 
 
+class DetectionSettings(BaseSettings):
+    """Signal detection threshold settings."""
+
+    model_config = SettingsConfigDict(env_prefix="", env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+    min_trade_size_usdc: float = Field(
+        default=50.0,
+        alias="MIN_TRADE_SIZE_USDC",
+        description="Minimum trade size in USDC to analyze",
+        gt=0,
+    )
+    fresh_wallet_max_nonce: int = Field(
+        default=5,
+        alias="FRESH_WALLET_MAX_NONCE",
+        description="Maximum nonce to consider a wallet fresh",
+        ge=0,
+    )
+    liquidity_impact_threshold: float = Field(
+        default=0.02,
+        alias="LIQUIDITY_IMPACT_THRESHOLD",
+        description="Volume impact threshold (e.g. 0.02 = 2%)",
+        gt=0,
+    )
+    alert_threshold: float = Field(
+        default=0.35,
+        alias="ALERT_THRESHOLD",
+        description="Minimum risk score to trigger an alert",
+        gt=0,
+        le=1.0,
+    )
+
+
 class DiscordSettings(BaseSettings):
     """Discord notification settings."""
 
-    model_config = SettingsConfigDict(env_prefix="DISCORD_")
+    model_config = SettingsConfigDict(env_prefix="DISCORD_", env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     webhook_url: SecretStr | None = Field(
         default=None,
@@ -126,7 +158,7 @@ class DiscordSettings(BaseSettings):
 class TelegramSettings(BaseSettings):
     """Telegram notification settings."""
 
-    model_config = SettingsConfigDict(env_prefix="TELEGRAM_")
+    model_config = SettingsConfigDict(env_prefix="TELEGRAM_", env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     bot_token: SecretStr | None = Field(
         default=None,
@@ -172,6 +204,7 @@ class Settings(BaseSettings):
     redis: RedisSettings = Field(default_factory=RedisSettings)
     polygon: PolygonSettings = Field(default_factory=PolygonSettings)
     polymarket: PolymarketSettings = Field(default_factory=PolymarketSettings)
+    detection: DetectionSettings = Field(default_factory=DetectionSettings)
     discord: DiscordSettings = Field(default_factory=DiscordSettings)
     telegram: TelegramSettings = Field(default_factory=TelegramSettings)
 
@@ -215,6 +248,12 @@ class Settings(BaseSettings):
             "polymarket": {
                 "ws_url": self.polymarket.ws_url,
                 "api_key": "(set)" if self.polymarket.api_key else "(not set)",
+            },
+            "detection": {
+                "min_trade_size_usdc": str(self.detection.min_trade_size_usdc),
+                "fresh_wallet_max_nonce": str(self.detection.fresh_wallet_max_nonce),
+                "liquidity_impact_threshold": str(self.detection.liquidity_impact_threshold),
+                "alert_threshold": str(self.detection.alert_threshold),
             },
             "discord_enabled": str(self.discord.enabled),
             "telegram_enabled": str(self.telegram.enabled),

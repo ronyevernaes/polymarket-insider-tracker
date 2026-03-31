@@ -20,7 +20,7 @@ from polymarket_insider_tracker.ingestor.models import TradeEvent
 logger = logging.getLogger(__name__)
 
 # Default configuration
-DEFAULT_ALERT_THRESHOLD = 0.6
+DEFAULT_ALERT_THRESHOLD = 0.35
 DEFAULT_DEDUP_WINDOW_SECONDS = 3600  # 1 hour
 DEFAULT_REDIS_KEY_PREFIX = "polymarket:dedup:"
 

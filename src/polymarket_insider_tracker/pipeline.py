@@ -235,12 +235,25 @@ class Pipeline:
 
         # Initialize Detectors
         logger.debug("Initializing detectors...")
-        self._fresh_wallet_detector = FreshWalletDetector(self._wallet_analyzer)
-        self._size_anomaly_detector = SizeAnomalyDetector(self._metadata_sync)
+        from decimal import Decimal
+        detection = settings.detection
+        self._fresh_wallet_detector = FreshWalletDetector(
+            self._wallet_analyzer,
+            min_trade_size=Decimal(str(detection.min_trade_size_usdc)),
+            max_nonce=detection.fresh_wallet_max_nonce,
+        )
+        self._size_anomaly_detector = SizeAnomalyDetector(
+            self._metadata_sync,
+            volume_threshold=detection.liquidity_impact_threshold,
+            min_trade_size=Decimal(str(detection.min_trade_size_usdc)),
+        )
 
         # Initialize Risk Scorer
         logger.debug("Initializing risk scorer...")
-        self._risk_scorer = RiskScorer(self._redis)
+        self._risk_scorer = RiskScorer(
+            self._redis,
+            alert_threshold=detection.alert_threshold,
+        )
 
         # Initialize Alerting
         logger.debug("Initializing alerting components...")

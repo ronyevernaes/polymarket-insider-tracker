@@ -17,9 +17,12 @@ logger = logging.getLogger(__name__)
 DEFAULT_VOLUME_THRESHOLD = 0.02  # 2% of daily volume
 DEFAULT_BOOK_THRESHOLD = 0.05  # 5% of order book depth
 DEFAULT_NICHE_VOLUME_THRESHOLD = Decimal("50000")  # $50k daily volume
+DEFAULT_MIN_TRADE_SIZE = Decimal("50")  # $50 USDC minimum notional value
 
 # Niche market categories - markets in these categories with low specificity
-# are more likely to have insider information value
+# are more likely to have insider information value.
+# "other" is included because most Polymarket markets fall in this category;
+# the $50 minimum trade size filter in analyze() prevents micro-trade noise.
 NICHE_PRONE_CATEGORIES = frozenset({"science", "tech", "finance", "other"})
 
 
@@ -59,6 +62,7 @@ class SizeAnomalyDetector:
         volume_threshold: float = DEFAULT_VOLUME_THRESHOLD,
         book_threshold: float = DEFAULT_BOOK_THRESHOLD,
         niche_volume_threshold: Decimal = DEFAULT_NICHE_VOLUME_THRESHOLD,
+        min_trade_size: Decimal = DEFAULT_MIN_TRADE_SIZE,
     ) -> None:
         """Initialize the size anomaly detector.
 
@@ -67,11 +71,13 @@ class SizeAnomalyDetector:
             volume_threshold: Threshold for volume impact (default 0.02 = 2%).
             book_threshold: Threshold for book impact (default 0.05 = 5%).
             niche_volume_threshold: Volume below which market is niche ($50k).
+            min_trade_size: Minimum notional value to analyze (default $50 USDC).
         """
         self._metadata_sync = metadata_sync
         self._volume_threshold = volume_threshold
         self._book_threshold = book_threshold
         self._niche_volume_threshold = niche_volume_threshold
+        self._min_trade_size = min_trade_size
 
     async def analyze(
         self,
@@ -99,6 +105,16 @@ class SizeAnomalyDetector:
             SizeAnomalySignal if the trade triggers anomaly detection,
             None otherwise.
         """
+        # Filter out trades below the minimum notional value
+        if trade.notional_value < self._min_trade_size:
+            logger.debug(
+                "Trade %s below minimum size: %s < %s USDC",
+                trade.trade_id,
+                trade.notional_value,
+                self._min_trade_size,
+            )
+            return None
+
         # Get market metadata
         try:
             metadata = await self._metadata_sync.get_market(trade.market_id)
