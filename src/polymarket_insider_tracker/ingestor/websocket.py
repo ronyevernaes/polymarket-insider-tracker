@@ -1,7 +1,10 @@
-"""WebSocket client for streaming Polymarket trade events."""
+"""Trade stream poller for Polymarket trade events.
+
+Polls the Polymarket Data API for recent trades on a short interval,
+replacing the previous WebSocket approach which lacked wallet-level data.
+"""
 
 import asyncio
-import json
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -9,23 +12,22 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-from websockets.asyncio.client import ClientConnection
-from websockets.asyncio.client import connect as ws_connect
-from websockets.exceptions import ConnectionClosed
+import httpx
 
 from polymarket_insider_tracker.ingestor.models import TradeEvent
 
 logger = logging.getLogger(__name__)
 
 # Constants
-DEFAULT_WS_HOST = "wss://ws-live-data.polymarket.com"
-DEFAULT_PING_INTERVAL = 30  # seconds
-DEFAULT_MAX_RECONNECT_DELAY = 30  # seconds
-DEFAULT_INITIAL_RECONNECT_DELAY = 1  # seconds
+TRADES_API_URL = "https://data-api.polymarket.com/trades"
+DEFAULT_POLL_INTERVAL = 10  # seconds between polls
+DEFAULT_BATCH_LIMIT = 50    # max trades per poll (API maximum)
+DEFAULT_MAX_RETRIES = 3
+DEFAULT_RETRY_DELAY = 5.0   # seconds
 
 
 class ConnectionState(Enum):
-    """WebSocket connection states."""
+    """Trade stream connection states."""
 
     DISCONNECTED = "disconnected"
     CONNECTING = "connecting"
@@ -49,7 +51,7 @@ class TradeStreamError(Exception):
 
 
 class ConnectionError(TradeStreamError):
-    """Raised when connection to WebSocket fails."""
+    """Raised when the trade stream cannot be started."""
 
 
 TradeCallback = Callable[[TradeEvent], Awaitable[None]]
@@ -57,11 +59,14 @@ StateCallback = Callable[[ConnectionState], Awaitable[None]]
 
 
 class TradeStreamHandler:
-    """WebSocket client for streaming Polymarket trade events.
+    """Polls Polymarket Data API for live trade events.
 
-    This handler maintains a persistent connection to Polymarket's real-time
-    trade feed, automatically reconnecting on disconnection with exponential
-    backoff.
+    Periodically fetches new trades since the last poll using the
+    data-api.polymarket.com/trades endpoint, which provides full trade
+    data including wallet addresses needed for insider detection.
+
+    The same on_trade callback interface is preserved so the rest of
+    the pipeline requires no changes.
 
     Example:
         >>> async def on_trade(trade: TradeEvent):
@@ -69,21 +74,18 @@ class TradeStreamHandler:
         ...
         >>> handler = TradeStreamHandler(on_trade=on_trade)
         >>> await handler.start()  # Blocks until stop() is called
-
-    Attributes:
-        state: Current connection state.
-        stats: Statistics about the stream (trades received, reconnects, etc.).
     """
 
     def __init__(
         self,
         on_trade: TradeCallback,
         *,
-        host: str = DEFAULT_WS_HOST,
+        host: str = TRADES_API_URL,  # kept for API compatibility, unused
         on_state_change: StateCallback | None = None,
-        ping_interval: int = DEFAULT_PING_INTERVAL,
-        max_reconnect_delay: int = DEFAULT_MAX_RECONNECT_DELAY,
-        initial_reconnect_delay: int = DEFAULT_INITIAL_RECONNECT_DELAY,
+        poll_interval: int = DEFAULT_POLL_INTERVAL,
+        batch_limit: int = DEFAULT_BATCH_LIMIT,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        retry_delay: float = DEFAULT_RETRY_DELAY,
         event_filter: str | None = None,
         market_filter: str | None = None,
     ) -> None:
@@ -91,28 +93,30 @@ class TradeStreamHandler:
 
         Args:
             on_trade: Async callback invoked for each trade event.
-            host: WebSocket endpoint URL.
+            host: Unused, kept for API compatibility with previous WS version.
             on_state_change: Optional callback for connection state changes.
-            ping_interval: Seconds between heartbeat pings.
-            max_reconnect_delay: Maximum delay between reconnection attempts.
-            initial_reconnect_delay: Initial delay for reconnection backoff.
+            poll_interval: Seconds between API polls (default 10).
+            batch_limit: Max trades to fetch per poll (default 50).
+            max_retries: Retries on consecutive API failures before giving up.
+            retry_delay: Seconds to wait between retries on failure.
             event_filter: Optional event slug to filter trades by event.
-            market_filter: Optional market slug to filter trades by market.
+            market_filter: Optional market condition ID to filter trades.
         """
         self._on_trade = on_trade
         self._on_state_change = on_state_change
-        self._host = host
-        self._ping_interval = ping_interval
-        self._max_reconnect_delay = max_reconnect_delay
-        self._initial_reconnect_delay = initial_reconnect_delay
+        self._poll_interval = poll_interval
+        self._batch_limit = batch_limit
+        self._max_retries = max_retries
+        self._retry_delay = retry_delay
         self._event_filter = event_filter
         self._market_filter = market_filter
 
         self._state = ConnectionState.DISCONNECTED
         self._stats = StreamStats()
-        self._ws: ClientConnection | None = None
         self._running = False
-        self._stop_event: asyncio.Event | None = None
+        self._last_ts: int = int(time.time())  # only process trades from now on
+        self._seen_hashes: set[str] = set()    # dedup within current poll window
+        self._http = httpx.AsyncClient(timeout=15.0)
 
     @property
     def state(self) -> ConnectionState:
@@ -130,66 +134,59 @@ class TradeStreamHandler:
             old_state = self._state
             self._state = new_state
             logger.info("Connection state: %s -> %s", old_state.value, new_state.value)
-
             if self._on_state_change:
                 try:
                     await self._on_state_change(new_state)
                 except Exception as e:
                     logger.error("Error in state change callback: %s", e)
 
-    def _build_subscription_message(self) -> dict[str, Any]:
-        """Build the WebSocket subscription message."""
-        subscription: dict[str, Any] = {
-            "topic": "activity",
-            "type": "trades",
+    def _build_params(self) -> dict[str, Any]:
+        """Build query params for the trades API request."""
+        params: dict[str, Any] = {
+            "limit": self._batch_limit,
+            "start_ts": self._last_ts,
         }
-
-        # Add filters if specified
         if self._event_filter:
-            subscription["filters"] = json.dumps({"event_slug": self._event_filter})
-        elif self._market_filter:
-            subscription["filters"] = json.dumps({"market_slug": self._market_filter})
+            params["event_slug"] = self._event_filter
+        if self._market_filter:
+            params["market"] = self._market_filter
+        return params
 
-        return {"subscriptions": [subscription]}
+    async def _fetch_trades(self) -> list[dict]:
+        """Fetch new trades from the Data API since last poll."""
+        params = self._build_params()
+        resp = await self._http.get(TRADES_API_URL, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, list) else data.get("data", [])
 
-    async def _connect(self) -> ClientConnection:
-        """Establish WebSocket connection."""
-        await self._set_state(ConnectionState.CONNECTING)
+    async def _poll_once(self) -> None:
+        """Run one poll cycle: fetch trades and fire callbacks."""
+        raw_trades = await self._fetch_trades()
 
-        try:
-            ws = await ws_connect(
-                self._host,
-                ping_interval=self._ping_interval,
-                ping_timeout=self._ping_interval * 2,
-            )
+        if not raw_trades:
+            return
 
-            # Send subscription message
-            subscribe_msg = self._build_subscription_message()
-            await ws.send(json.dumps(subscribe_msg))
+        # Trades come newest-first; process oldest-first so callbacks fire in order
+        new_trades = []
+        for raw in reversed(raw_trades):
+            tx_hash = str(raw.get("transactionHash", ""))
+            if tx_hash and tx_hash in self._seen_hashes:
+                continue
+            ts = int(raw.get("timestamp", 0))
+            if ts <= self._last_ts and tx_hash in self._seen_hashes:
+                continue
+            new_trades.append(raw)
 
-            logger.info("Connected to %s and subscribed to trades", self._host)
-            await self._set_state(ConnectionState.CONNECTED)
-            self._stats.connected_since = time.time()
+        if not new_trades:
+            return
 
-            return ws
-
-        except Exception as e:
-            logger.error("Failed to connect: %s", e)
-            self._stats.last_error = str(e)
-            raise ConnectionError(f"Failed to connect to {self._host}: {e}") from e
-
-    async def _handle_message(self, message: str) -> None:
-        """Parse and process an incoming WebSocket message."""
-        try:
-            data = json.loads(message)
-
-            # Check if this is a trade message
-            topic = data.get("topic")
-            msg_type = data.get("type")
-
-            if topic == "activity" and msg_type == "trades":
-                payload = data.get("payload", {})
-                trade = TradeEvent.from_websocket_message(payload)
+        for raw in new_trades:
+            try:
+                trade = TradeEvent.from_websocket_message(raw)
+                tx_hash = str(raw.get("transactionHash", ""))
+                if tx_hash:
+                    self._seen_hashes.add(tx_hash)
 
                 self._stats.trades_received += 1
                 self._stats.last_trade_time = time.time()
@@ -202,138 +199,92 @@ class TradeStreamHandler:
                     trade.market_slug,
                 )
 
-                try:
-                    await self._on_trade(trade)
-                except Exception as e:
-                    logger.error("Error in trade callback: %s", e)
-
-            else:
-                # Log other message types for debugging
-                logger.debug("Received message: topic=%s type=%s", topic, msg_type)
-
-        except json.JSONDecodeError as e:
-            logger.warning("Invalid JSON message: %s", e)
-        except Exception as e:
-            logger.error("Error processing message: %s", e)
-
-    async def _listen(self, ws: ClientConnection) -> None:
-        """Listen for messages on the WebSocket."""
-        try:
-            async for message in ws:
-                if not self._running:
-                    break
-
-                if isinstance(message, str):
-                    await self._handle_message(message)
-                else:
-                    logger.debug("Received binary message (%d bytes)", len(message))
-
-        except ConnectionClosed as e:
-            logger.warning("Connection closed: %s", e)
-            raise
-        except Exception as e:
-            logger.error("Error in message loop: %s", e)
-            raise
-
-    async def _reconnect_loop(self) -> None:
-        """Handle reconnection with exponential backoff."""
-        delay = self._initial_reconnect_delay
-
-        while self._running:
-            try:
-                await self._set_state(ConnectionState.RECONNECTING)
-
-                logger.info("Reconnecting in %.1f seconds...", delay)
-                await asyncio.sleep(delay)
-
-                if not self._running:
-                    break
-
-                self._ws = await self._connect()
-                self._stats.reconnect_count += 1
-                delay = self._initial_reconnect_delay  # Reset delay on success
-                return
+                await self._on_trade(trade)
 
             except Exception as e:
-                logger.error("Reconnection failed: %s", e)
-                self._stats.last_error = str(e)
+                logger.error("Error processing trade: %s", e)
 
-                # Exponential backoff with jitter
-                delay = min(delay * 2, self._max_reconnect_delay)
+        # Advance cursor to the timestamp of the most recent trade
+        latest_ts = max(int(r.get("timestamp", 0)) for r in new_trades)
+        if latest_ts > self._last_ts:
+            self._last_ts = latest_ts
+
+        # Bound the seen_hashes set to avoid unbounded memory growth
+        if len(self._seen_hashes) > 10_000:
+            self._seen_hashes.clear()
 
     async def start(self) -> None:
-        """Connect and begin streaming trades.
-
-        This method blocks until stop() is called. It automatically
-        handles reconnection on disconnection.
+        """Begin polling for trades. Blocks until stop() is called.
 
         Raises:
-            ConnectionError: If initial connection fails.
+            ConnectionError: If initial API check fails.
         """
         if self._running:
             logger.warning("Handler already running")
             return
 
         self._running = True
-        self._stop_event = asyncio.Event()
+        await self._set_state(ConnectionState.CONNECTING)
 
+        # Verify the API is reachable before declaring connected
+        consecutive_failures = 0
         try:
-            # Initial connection
-            self._ws = await self._connect()
+            await self._fetch_trades()
+            consecutive_failures = 0
+        except Exception as e:
+            logger.error("Initial trade fetch failed: %s", e)
+            self._stats.last_error = str(e)
+            raise ConnectionError(f"Failed to connect to {TRADES_API_URL}: {e}") from e
 
-            # Main loop
-            while self._running:
-                try:
-                    await self._listen(self._ws)
-                except (ConnectionClosed, Exception) as e:
-                    if not self._running:
-                        break
+        await self._set_state(ConnectionState.CONNECTED)
+        self._stats.connected_since = time.time()
+        logger.info("Trade stream polling started (interval=%ds)", self._poll_interval)
 
-                    logger.warning("Connection lost: %s", e)
-                    await self._set_state(ConnectionState.DISCONNECTED)
+        while self._running:
+            await asyncio.sleep(self._poll_interval)
+            if not self._running:
+                break
 
-                    # Attempt reconnection
-                    await self._reconnect_loop()
+            try:
+                await self._poll_once()
+                if consecutive_failures > 0:
+                    consecutive_failures = 0
+                    await self._set_state(ConnectionState.CONNECTED)
+                    self._stats.reconnect_count += 1
 
-                    if not self._running or self._ws is None:
-                        break
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                consecutive_failures += 1
+                self._stats.last_error = str(e)
+                logger.warning(
+                    "Poll failed (%d/%d): %s",
+                    consecutive_failures,
+                    self._max_retries,
+                    e,
+                )
+                if consecutive_failures >= self._max_retries:
+                    await self._set_state(ConnectionState.RECONNECTING)
+                await asyncio.sleep(self._retry_delay)
 
-        finally:
-            await self._cleanup()
+        await self._cleanup()
 
     async def stop(self) -> None:
-        """Gracefully disconnect from the WebSocket.
-
-        This signals the handler to stop and cleanly close the connection.
-        """
+        """Gracefully stop polling."""
         if not self._running:
             return
-
         logger.info("Stopping trade stream handler...")
         self._running = False
-
-        if self._stop_event:
-            self._stop_event.set()
-
         await self._cleanup()
 
     async def _cleanup(self) -> None:
         """Clean up resources."""
-        if self._ws:
-            try:
-                await self._ws.close()
-            except Exception as e:
-                logger.debug("Error closing WebSocket: %s", e)
-            finally:
-                self._ws = None
-
+        await self._http.aclose()
         await self._set_state(ConnectionState.DISCONNECTED)
         logger.info("Trade stream handler stopped")
 
     async def __aenter__(self) -> "TradeStreamHandler":
-        """Async context manager entry."""
         return self
 
     async def __aexit__(self, *args: Any) -> None:
-        """Async context manager exit."""
         await self.stop()
