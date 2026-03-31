@@ -276,10 +276,11 @@ class AlertFormatter:
     ) -> str:
         """Build Telegram-optimized markdown format."""
         trade = assessment.trade_event
+        e = self._escape_telegram_markdown  # shorthand
 
         lines = ["🚨 *Suspicious Activity Detected*", ""]
 
-        # Wallet with link
+        # Wallet with link (wallet_short is inside a code span — backticks protect it)
         wallet_line = f"*Wallet:* `{wallet_short}`"
         if assessment.fresh_wallet_signal:
             age_hours = assessment.fresh_wallet_signal.wallet_profile.age_hours
@@ -290,27 +291,31 @@ class AlertFormatter:
                     wallet_line += f" \\(Age: {age_hours:.0f}h\\)"
         lines.append(wallet_line)
 
-        # Risk score
-        lines.append(f"*Risk Score:* {assessment.weighted_score:.2f} \\({risk_level}\\)")
+        # Risk score — the decimal point in e.g. "0.38" must be escaped
+        score_escaped = e(f"{assessment.weighted_score:.2f}")
+        lines.append(f"*Risk Score:* {score_escaped} \\({risk_level}\\)")
 
         # Market
         market_title = trade.event_title or trade.market_slug or "Unknown Market"
-        # Escape special Telegram markdown characters
-        market_title_escaped = self._escape_telegram_markdown(market_title)
+        market_title_escaped = e(market_title)
         if "market" in links:
             lines.append(f"*Market:* [{market_title_escaped}]({links['market']})")
         else:
             lines.append(f"*Market:* {market_title_escaped}")
 
-        # Trade details
-        usdc_value = format_usdc(trade.notional_value).replace("$", "\\$")
+        # Trade details — escape side, outcome, price, and USDC amount
+        side_escaped = e(str(trade.side))
+        outcome_escaped = e(str(trade.outcome))
+        price_escaped = e(f"{trade.price:.3f}")
+        usdc_escaped = e(format_usdc(trade.notional_value))
         lines.append(
-            f"*Trade:* {trade.side} {trade.outcome} @ \\${trade.price:.3f} \\| {usdc_value}"
+            f"*Trade:* {side_escaped} {outcome_escaped} @ \\${price_escaped} \\| {usdc_escaped}"
         )
 
         # Signals
         if signals:
-            lines.append(f"*Signals:* {', '.join(signals)}")
+            signals_escaped = [e(s) for s in signals]
+            lines.append(f"*Signals:* {', '.join(signals_escaped)}")
 
         # Links
         lines.append("")
