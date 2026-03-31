@@ -11,6 +11,7 @@ This module provides a Polygon client for wallet data queries with:
 import asyncio
 import json
 import logging
+import ssl
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any, cast
 
+import certifi
 from redis.asyncio import Redis
 from web3 import AsyncWeb3
 from web3.exceptions import Web3Exception
@@ -142,11 +144,15 @@ class PolygonClient:
         self._max_retries = max_retries
         self._retry_delay = retry_delay_seconds
 
+        # Build SSL context using certifi so macOS Python finds the CA bundle
+        _ssl_context = ssl.create_default_context(cafile=certifi.where())
+        _request_kwargs = {"ssl": _ssl_context}
+
         # Create web3 instances
-        self._w3 = AsyncWeb3(AsyncHTTPProvider(rpc_url))
+        self._w3 = AsyncWeb3(AsyncHTTPProvider(rpc_url, request_kwargs=_request_kwargs))
         self._w3_fallback: AsyncWeb3[AsyncHTTPProvider] | None = None
         if fallback_rpc_url:
-            self._w3_fallback = AsyncWeb3(AsyncHTTPProvider(fallback_rpc_url))
+            self._w3_fallback = AsyncWeb3(AsyncHTTPProvider(fallback_rpc_url, request_kwargs=_request_kwargs))
 
         # Rate limiter
         self._rate_limiter = RateLimiter.create(max_requests_per_second)
