@@ -4,9 +4,12 @@ import os
 from logging.config import fileConfig
 
 from alembic import context
+from dotenv import load_dotenv
 from sqlalchemy import engine_from_config, pool
 
 from polymarket_insider_tracker.storage.models import Base
+
+load_dotenv()
 
 # this is the Alembic Config object
 config = context.config
