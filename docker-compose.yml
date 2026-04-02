@@ -34,6 +34,21 @@ services:
       start_period: 5s
     restart: unless-stopped
 
+  bot:
+    build: .
+    container_name: polymarket-inside-tracker-bot
+    env_file: .env
+    environment:
+      # Override localhost addresses with Docker service names
+      DATABASE_URL: postgresql://${POSTGRES_USER:-tracker}:${POSTGRES_PASSWORD:-dev_password}@postgres:5432/${POSTGRES_DB:-polymarket_tracker}
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
   # Optional development tools - use with: docker compose --profile tools up
   adminer:
     image: adminer:latest
